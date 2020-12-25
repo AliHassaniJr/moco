@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+# Adjusted for cpu fine-tuning
 import argparse
 import builtins
 import os
@@ -25,9 +26,11 @@ model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
 
-parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
+parser = argparse.ArgumentParser(description='Fine-tuning script')
 parser.add_argument('data', metavar='DIR',
                     help='path to dataset')
+parser.add_argument('-nc', '--num-class', default=1000, type=int, metavar='N',
+                    help='number of classes (default: 1000)')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
                     choices=model_names,
                     help='model architecture: ' +
@@ -149,6 +152,7 @@ def main_worker(gpu, ngpus_per_node, args):
         if name not in ['fc.weight', 'fc.bias']:
             param.requires_grad = False
     # init the fc layer
+    model.fc = nn.Linear(2048, args.num_class, bias=True)
     model.fc.weight.data.normal_(mean=0.0, std=0.01)
     model.fc.bias.data.zero_()
 
@@ -203,10 +207,14 @@ def main_worker(gpu, ngpus_per_node, args):
             model.features = torch.nn.DataParallel(model.features)
             model.cuda()
         else:
-            model = torch.nn.DataParallel(model).cuda()
+            model = torch.nn.DataParallel(model)
+            if torch.cuda.is_available():
+                model = model.cuda()
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
+    criterion = nn.CrossEntropyLoss()
+    if torch.cuda.is_available():
+        criterion = criterion.cuda(args.gpu)
 
     # optimize only the linear classifier
     parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
@@ -330,16 +338,17 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         # measure data loading time
         data_time.update(time.time() - end)
 
-        if args.gpu is not None:
-            images = images.cuda(args.gpu, non_blocking=True)
-        target = target.cuda(args.gpu, non_blocking=True)
+        if torch.cuda.is_available():
+            if args.gpu is not None:
+                images = images.cuda(args.gpu, non_blocking=True)
+            target = target.cuda(args.gpu, non_blocking=True)
 
         # compute output
         output = model(images)
         loss = criterion(output, target)
 
         # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        acc1, acc5 = accuracy(output, target, topk=(1, 5), num_class=args.num_class)
         losses.update(loss.item(), images.size(0))
         top1.update(acc1[0], images.size(0))
         top5.update(acc5[0], images.size(0))
@@ -373,16 +382,17 @@ def validate(val_loader, model, criterion, args):
     with torch.no_grad():
         end = time.time()
         for i, (images, target) in enumerate(val_loader):
-            if args.gpu is not None:
-                images = images.cuda(args.gpu, non_blocking=True)
-            target = target.cuda(args.gpu, non_blocking=True)
+            if torch.cuda.is_available():
+                if args.gpu is not None:
+                    images = images.cuda(args.gpu, non_blocking=True)
+                target = target.cuda(args.gpu, non_blocking=True)
 
             # compute output
             output = model(images)
             loss = criterion(output, target)
 
             # measure accuracy and record loss
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            acc1, acc5 = accuracy(output, target, topk=(1, 5), num_class=args.num_class)
             losses.update(loss.item(), images.size(0))
             top1.update(acc1[0], images.size(0))
             top5.update(acc5[0], images.size(0))
@@ -481,10 +491,10 @@ def adjust_learning_rate(optimizer, epoch, args):
         param_group['lr'] = lr
 
 
-def accuracy(output, target, topk=(1,)):
+def accuracy(output, target, topk=(1,), num_class=2):
     """Computes the accuracy over the k top predictions for the specified values of k"""
     with torch.no_grad():
-        maxk = max(topk)
+        maxk = min(max(topk), num_class)
         batch_size = target.size(0)
 
         _, pred = output.topk(maxk, 1, True, True)
@@ -493,8 +503,11 @@ def accuracy(output, target, topk=(1,)):
 
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
-            res.append(correct_k.mul_(100.0 / batch_size))
+            if k < num_class:
+                correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+                res.append(correct_k.mul_(100.0 / batch_size))
+            else:
+                res.append([100.0])
         return res
 
 
